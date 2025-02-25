@@ -1,0 +1,10 @@
+[package]
+name = "xposeit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "0.14", features = ["full"] }
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
