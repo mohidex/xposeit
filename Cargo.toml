@@ -1,0 +1,28 @@
+[package]
+name = "xposeit"
+version = "0.1.0"
+edition = "2021"
+
+
+[[bin]]
+name = "xpose-cli"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "xpose-server"
+path = "src/bin/server.rs"
+
+
+[dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.41", features = ["derive", "env"] }
+dashmap = "6.1.0"
+tokio = { version = "1.46.1", features = ["rt-multi-thread", "io-util", "macros", "net", "time"] }
+tokio-util = { version = "0.7.15", features = ["codec"] }
+tracing = "0.1.32"
+tracing-subscriber = "0.3.18"
+uuid = { version = "1.17.0", features = ["serde", "v4"] }
+serde_json = "1.0.79"
+serde = { version = "1.0.136", features = ["derive"] }
+futures-util = { version = "0.3.21", features = ["sink"] }
+fastrand = "2.3.0"
