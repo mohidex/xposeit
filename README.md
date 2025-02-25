@@ -1,4 +1,4 @@
-# xposeit
+# XposeIt
 Instantly expose your local apps
 
 ---
