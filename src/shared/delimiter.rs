@@ -48,3 +48,125 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
         self.0.into_parts()
     }
 }
+
+// Unit tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::delimiter::Delimited;
+    use crate::shared::messages::{ClientMessage, ServerMessage};
+    use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn test_send_and_recv() -> Result<()> {
+        // Create a TCP listener
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        // Spawn a server task
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let mut delimited = Delimited::new(socket);
+
+            // Receive a message from the client
+            let msg: Option<ClientMessage> = delimited.recv().await?;
+            assert_eq!(msg, Some(ClientMessage::Open)); // This will now work
+
+            // Send a response to the client
+            delimited.send(ServerMessage::Opened(8080)).await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // Connect to the server
+        let stream = TcpStream::connect(addr).await?;
+        let mut delimited = Delimited::new(stream);
+
+        // Send a message to the server
+        delimited.send(ClientMessage::Open).await?;
+
+        // Receive a response from the server
+        let msg: Option<ServerMessage> = delimited.recv().await?;
+        assert_eq!(msg, Some(ServerMessage::Opened(8080))); // This will now work
+
+        // Wait for the server task to complete
+        server_task.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_into_parts() -> Result<()> {
+        // Create a TCP listener
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        // Spawn a server task
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let delimited = Delimited::new(socket);
+
+            // Consume the delimited stream and return its parts
+            let parts = delimited.into_parts();
+            assert!(parts.read_buf.is_empty()); // Ensure the read buffer is empty
+            assert!(parts.write_buf.is_empty()); // Ensure the write buffer is empty
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // Connect to the server
+        let stream = TcpStream::connect(addr).await?;
+        let delimited = Delimited::new(stream);
+
+        // Consume the delimited stream and return its parts
+        let parts = delimited.into_parts();
+        assert!(parts.read_buf.is_empty()); // Ensure the read buffer is empty
+        assert!(parts.write_buf.is_empty()); // Ensure the write buffer is empty
+
+        // Wait for the server task to complete
+        server_task.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_serialization_and_deserialization() -> Result<()> {
+        // Create a TCP listener
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        // Spawn a server task
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let mut delimited = Delimited::new(socket);
+
+            // Receive a message from the client
+            let msg: Option<String> = delimited.recv().await?;
+            let client_msg: ClientMessage = serde_json::from_str(&msg.unwrap())?;
+            assert_eq!(client_msg, ClientMessage::Open);
+
+            // Send a response to the client
+            let server_msg = serde_json::to_string(&ServerMessage::Opened(8080))?;
+            delimited.send(server_msg).await?;
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // Connect to the server
+        let stream = TcpStream::connect(addr).await?;
+        let mut delimited = Delimited::new(stream);
+
+        // Send a message to the server
+        let client_msg = serde_json::to_string(&ClientMessage::Open)?;
+        delimited.send(client_msg).await?;
+
+        // Receive a response from the server
+        let msg: Option<String> = delimited.recv().await?;
+        let server_msg: ServerMessage = serde_json::from_str(&msg.unwrap())?;
+        assert_eq!(server_msg, ServerMessage::Opened(8080));
+
+        // Wait for the server task to complete
+        server_task.await??;
+
+        Ok(())
+    }
+}

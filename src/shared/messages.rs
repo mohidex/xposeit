@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Represents a message sent from the client to the server over the control connection.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum ClientMessage {
     /// Initial message sent by the client to request the server to open a port for forwarding.
     Open,
@@ -12,7 +12,7 @@ pub enum ClientMessage {
 }
 
 /// Represents a message sent from the server to the client over the control connection.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum ServerMessage {
     /// Response to the client's `Open` request, indicating the port that has been opened for forwarding.
     Opened(u16),
