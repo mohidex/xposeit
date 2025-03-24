@@ -3,6 +3,16 @@ name = "xposeit"
 version = "0.1.0"
 edition = "2021"
 
+
+[[bin]]
+name = "xpose-cli"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "xpose-server"
+path = "src/bin/server.rs"
+
+
 [dependencies]
 anyhow = "1.0.97"
 clap = { version = "4.0.22", features = ["derive", "env"] }
