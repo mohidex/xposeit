@@ -12,7 +12,6 @@ struct Args {
     /// Maximum accepted TCP port number.
     #[clap(long, default_value_t = 65535)]
     max_port: u16,
-    
 }
 
 #[tokio::main]

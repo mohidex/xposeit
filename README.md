@@ -3,19 +3,23 @@ Instantly expose your local apps
 
 ## Quick Start
 
-1. **Start the server**:
+
+1. **Build the binaries**:
    ```bash
-   cargo run server
+   cargo build
    ```
 
-2. **Expose a port**:
+2. **Run server and Expose a port**:
    ```bash
-   cargo run xpose -p 8000
+   # Run server
+   ./target/debug/xpose-server
+   # Expose a local app
+   ./target/debug/xpose-cli --port 8000
    ```
    Output:
    ```
    Listening at localhost:22475
-   Your server is accessible through localhost:22475
+   Your localhost:8000 server is accessible through localhost:22475
    ```
 
 3. **Access your server**:
