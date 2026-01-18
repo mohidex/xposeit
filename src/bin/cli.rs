@@ -23,8 +23,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let client = XposeCli::new(&args.local_host, args.port, &args.to).await?;
-    client.listen().await?;
+    let client = XposeCli::new(&args.local_host, args.port, &args.to);
+    client.run().await?;
 
     Ok(())
 }

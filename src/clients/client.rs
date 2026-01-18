@@ -1,96 +1,161 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 use tracing::{error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
-use crate::shared::frame::Delimited;
-use crate::shared::proxy::proxy;
+use crate::shared::{
+    frame::Delimited,
+    messages::{ClientMessage, ServerMessage},
+    proxy::proxy,
+};
 
-use crate::shared::messages::{ClientMessage, ServerMessage};
+/// Client session state machine
+struct Session<S> {
+    conn: Delimited<TcpStream>,
+    state: S,
+}
 
-/// State structure for the client.
+/// Initial state
+struct Init;
+
+/// Opened state
+struct Opened {
+    remote_port: u16,
+}
+
 pub struct XposeCli {
-    /// Control connection to the server.
-    conn: Option<Delimited<TcpStream>>,
-
-    // Local host that is forwarded.
+    /// The local host to expose.
     local_host: String,
 
-    /// Local port that is forwarded.
-    port: u16,
+    /// The local port to expose.
+    local_port: u16,
 
-    /// Destination address of the server.
-    to: String,
+    /// Address of the remote server.
+    server: String,
 }
 
 impl XposeCli {
-    /// Create a new client.
-    pub async fn new(local_host: &str, port: u16, to: &str) -> Result<Self> {
-        let mut stream = Delimited::new(connect_with_timeout(to, 7835).await?);
-
-        stream.send(ClientMessage::Open).await?;
-        let remote_port = match stream.recv_timeout().await? {
-            Some(ServerMessage::Opened(remote_port)) => remote_port,
-            Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
-            Some(_) => bail!("unexpected initial non-hello message"),
-            None => bail!("unexpected EOF"),
-        };
-        info!(remote_port, "connected to server");
-        info!("listening at {to}:{remote_port}");
-
-        Ok(XposeCli {
-            conn: Some(stream),
-            to: to.to_string(),
+    pub fn new(local_host: &str, port: u16, server: &str) -> Self {
+        Self {
             local_host: local_host.to_string(),
-            port,
-        })
+            local_port: port,
+            server: server.to_string(),
+        }
     }
 
-    /// Start the client, listening for new connections.
-    pub async fn listen(mut self) -> Result<()> {
-        let mut conn = self.conn.take().unwrap();
-        let this = Arc::new(self);
+    pub async fn run(self) -> Result<()> {
+        let stream = Delimited::new(connect_with_timeout(&self.server, 7835).await?);
+
+        let session = Session {
+            conn: stream,
+            state: Init,
+        };
+
+        let session = session.open().await?;
+
+        info!("listening at {}:{}", self.server, session.state.remote_port);
+
+        session.listen(Arc::new(self)).await
+    }
+}
+
+/// Implement session state machine
+impl Session<Init> {
+    async fn open(mut self) -> Result<Session<Opened>> {
+        self.conn.send(ClientMessage::Open).await?;
+
+        match self.conn.recv_timeout().await? {
+            Some(ServerMessage::Opened(port)) => {
+                info!(remote_port = port, "connected to server");
+                Ok(Session {
+                    conn: self.conn,
+                    state: Opened { remote_port: port },
+                })
+            }
+            Some(ServerMessage::Error(msg)) => bail!("server error: {msg}"),
+            Some(_) => bail!("protocol error: unexpected message"),
+            None => bail!("unexpected EOF"),
+        }
+    }
+}
+
+impl Session<Opened> {
+    async fn listen(mut self, cli: Arc<XposeCli>) -> Result<()> {
         loop {
-            match conn.recv().await? {
-                Some(ServerMessage::Opened(_)) => warn!("unexpected request"),
-                Some(ServerMessage::Heartbeat) => (),
+            match self.conn.recv().await? {
+                Some(ServerMessage::Heartbeat) => {
+                    // Optionally log heartbeats at trace level
+                    // trace!("received heartbeat");
+                }
+
                 Some(ServerMessage::Connection(id)) => {
-                    let this = Arc::clone(&this);
+                    info!(%id, "received forwarding request");
+                    let cli = Arc::clone(&cli);
                     tokio::spawn(
                         async move {
-                            info!("new connection");
-                            match this.handle_connection(id).await {
-                                Ok(_) => info!("connection exited"),
-                                Err(err) => warn!(%err, "connection exited with error"),
+                            if let Err(err) = handle_proxy(cli, id).await {
+                                warn!(%err, "proxy connection failed");
                             }
                         }
                         .instrument(info_span!("proxy", %id)),
                     );
                 }
-                Some(ServerMessage::Error(err)) => error!(%err, "server error"),
-                None => return Ok(()),
+
+                Some(ServerMessage::Error(err)) => {
+                    error!(%err, "server error");
+                    return Err(anyhow!("server error: {err}"));
+                }
+
+                Some(ServerMessage::Opened(_)) => {
+                    warn!("protocol error: unexpected Opened message");
+                    return Err(anyhow!("protocol error: duplicate Opened"));
+                }
+
+                None => {
+                    info!("control connection closed by server");
+                    return Ok(());
+                }
             }
         }
     }
+}
 
-    async fn handle_connection(&self, id: Uuid) -> Result<()> {
-        let mut remote_conn = Delimited::new(connect_with_timeout(&self.to[..], 7835).await?);
-        remote_conn.send(ClientMessage::Accept(id)).await?;
-        let mut local_conn = connect_with_timeout(&self.local_host, self.port).await?;
-        let parts = remote_conn.into_parts();
-        debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
-        local_conn.write_all(&parts.read_buf).await?; // mostly of the cases, this will be empty
-        proxy(local_conn, parts.io).await?;
-        Ok(())
+/// Handle a proxy connection
+async fn handle_proxy(cli: Arc<XposeCli>, id: Uuid) -> Result<()> {
+    info!(%id, "establishing proxy connection");
+
+    // Create a NEW connection specifically for this proxy session
+    let mut control = Delimited::new(connect_with_timeout(&cli.server, 7835).await?);
+
+    // Send Accept on this NEW connection
+    control.send(ClientMessage::Accept(id)).await?;
+
+    // Connect to local service
+    let mut local = connect_with_timeout(&cli.local_host, cli.local_port).await?;
+
+    // Extract the underlying stream from the framed connection
+    let parts = control.into_parts();
+
+    debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
+
+    // If there's any buffered data from the server, write it to local
+    if !parts.read_buf.is_empty() {
+        local.write_all(&parts.read_buf).await?;
     }
+
+    // Proxy bidirectional data between local service and remote client
+    info!(%id, "proxying data");
+    proxy(local, parts.io).await?;
+
+    info!(%id, "proxy connection closed");
+    Ok(())
 }
 
 async fn connect_with_timeout(to: &str, port: u16) -> Result<TcpStream> {
-    match timeout(Duration::from_secs(3), TcpStream::connect((to, port))).await {
-        Ok(res) => res,
-        Err(err) => Err(err.into()),
-    }
-    .with_context(|| format!("could not connect to {to}:{port}"))
+    timeout(Duration::from_secs(3), TcpStream::connect((to, port)))
+        .await
+        .context("connect timeout")?
+        .context(format!("could not connect to {to}:{port}"))
 }
