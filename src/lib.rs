@@ -1,6 +1,7 @@
 pub mod clients;
 pub use clients::XposeCli;
 
+pub mod protocol;
 pub mod servers;
-pub mod shared;
 pub use servers::XposeServer;
+pub mod utils;

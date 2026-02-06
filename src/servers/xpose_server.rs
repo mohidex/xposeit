@@ -10,11 +10,11 @@ use tokio::{
 use tracing::{info, info_span, warn, Instrument};
 use uuid::Uuid;
 
-use crate::shared::{
+use crate::protocol::{
     frame::Delimited,
     messages::{ClientMessage, ServerMessage},
-    proxy::proxy,
 };
+use crate::utils::proxy;
 
 pub struct XposeServer {
     /// Range of TCP ports that can be forwarded.

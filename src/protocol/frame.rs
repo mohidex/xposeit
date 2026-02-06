@@ -53,8 +53,8 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::frame::Delimited;
-    use crate::shared::messages::{ClientMessage, ServerMessage};
+    use crate::protocol::frame::Delimited;
+    use crate::protocol::messages::{ClientMessage, ServerMessage};
     use tokio::net::TcpListener;
     use tokio::net::TcpStream;
 

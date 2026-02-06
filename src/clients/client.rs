@@ -5,11 +5,11 @@ use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 use tracing::{error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
-use crate::shared::{
+use crate::protocol::{
     frame::Delimited,
     messages::{ClientMessage, ServerMessage},
-    proxy::proxy,
 };
+use crate::utils::proxy;
 
 /// Client session state machine
 struct Session<S> {
