@@ -141,7 +141,8 @@ mod tests {
 
             // Receive a message from the client
             let msg: Option<String> = delimited.recv().await?;
-            let client_msg: ClientMessage = serde_json::from_str(&msg.unwrap())?;
+            let msg = msg.ok_or_else(|| anyhow::anyhow!("received empty message from client"))?;
+            let client_msg: ClientMessage = serde_json::from_str(&msg)?;
             assert_eq!(client_msg, ClientMessage::Open);
 
             // Send a response to the client
@@ -161,7 +162,8 @@ mod tests {
 
         // Receive a response from the server
         let msg: Option<String> = delimited.recv().await?;
-        let server_msg: ServerMessage = serde_json::from_str(&msg.unwrap())?;
+        let msg = msg.ok_or_else(|| anyhow::anyhow!("received empty message from server"))?;
+        let server_msg: ServerMessage = serde_json::from_str(&msg)?;
         assert_eq!(server_msg, ServerMessage::Opened(8080));
 
         // Wait for the server task to complete

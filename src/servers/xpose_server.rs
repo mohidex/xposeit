@@ -1,9 +1,9 @@
-use std::{io, net::SocketAddr, ops::RangeInclusive, sync::Arc, time::Duration};
+use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, sync::Mutex, time::Duration};
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{self, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::{sleep, timeout},
 };
@@ -16,20 +16,67 @@ use crate::protocol::{
 };
 use crate::utils::proxy;
 
-pub struct XposeServer {
-    /// Range of TCP ports that can be forwarded.
-    port_range: RangeInclusive<u16>,
+/// Port pool state for efficient port allocation
+struct PortPool {
+    /// Shuffled list of ports to try
+    ports: Vec<u16>,
+    /// Current position in the pool
+    current_index: usize,
+    /// Number of times the pool has been exhausted and regenerated
+    pool_regenerations: usize,
+}
 
+impl PortPool {
+    fn new(port_range: RangeInclusive<u16>) -> Self {
+        let mut ports: Vec<u16> = port_range.collect();
+        fastrand::shuffle(&mut ports);
+
+        Self {
+            ports,
+            current_index: 0,
+            pool_regenerations: 0,
+        }
+    }
+
+    /// Get the next port from the pool. Returns None if pool is exhausted after max regenerations.
+    fn next_port(&mut self, max_regenerations: usize) -> Option<u16> {
+        if self.current_index >= self.ports.len() {
+            if self.pool_regenerations < max_regenerations {
+                // Reshuffle and reset
+                fastrand::shuffle(&mut self.ports);
+                self.current_index = 0;
+                self.pool_regenerations += 1;
+                warn!(
+                    regeneration = self.pool_regenerations,
+                    "port pool exhausted, regenerating..."
+                );
+            } else {
+                return None;
+            }
+        }
+
+        let port = self.ports[self.current_index];
+        self.current_index += 1;
+        Some(port)
+    }
+}
+
+pub struct XposeServer {
     /// Concurrent map of IDs to incoming connections.
     conns: Arc<DashMap<Uuid, TcpStream>>,
+
+    /// Port pool for allocation
+    port_pool: Mutex<PortPool>,
 }
 
 impl XposeServer {
     pub fn new(port_range: RangeInclusive<u16>) -> Self {
         assert!(!port_range.is_empty(), "must provide at least one port");
+        let port_pool = PortPool::new(port_range.clone());
+
         Self {
-            port_range,
             conns: Arc::new(DashMap::new()),
+            port_pool: Mutex::new(port_pool),
         }
     }
 
@@ -57,22 +104,43 @@ impl XposeServer {
     }
 
     async fn create_listener(&self) -> Result<TcpListener> {
-        for _ in 0..150 {
-            let port = fastrand::u16(self.port_range.clone());
+        const MAX_POOL_REGENERATIONS: usize = 3;
+
+        loop {
+            let port = {
+                let mut pool = self
+                    .port_pool
+                    .lock()
+                    .map_err(|e| anyhow!("failed to acquire port pool lock: {}", e))?;
+                pool.next_port(MAX_POOL_REGENERATIONS)
+            };
+
+            let port = match port {
+                Some(p) => p,
+                None => {
+                    return Err(anyhow!(
+                        "failed to find an available port after exhausting all port pools"
+                    ))
+                }
+            };
+
             match TcpListener::bind(("0.0.0.0", port)).await {
-                Ok(l) => return Ok(l),
+                Ok(l) => {
+                    info!(port, "successfully bound to port");
+                    return Ok(l);
+                }
                 Err(err)
                     if matches!(
                         err.kind(),
                         io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
                     ) =>
                 {
-                    continue
+                    // Port not available, try next one from pool
+                    continue;
                 }
                 Err(err) => return Err(err.into()),
             }
         }
-        Err(anyhow!("failed to find an available port"))
     }
 }
 
