@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
+use tokio::{io::copy_bidirectional, io::AsyncWriteExt, net::TcpStream, time::timeout};
 use tracing::{error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
@@ -9,7 +9,6 @@ use crate::protocol::{
     frame::Delimited,
     messages::{ClientMessage, ServerMessage},
 };
-use crate::utils::proxy;
 
 /// Client session state machine
 struct Session<S> {
@@ -136,20 +135,33 @@ async fn handle_proxy(cli: Arc<XposeCli>, id: Uuid) -> Result<()> {
     let mut local = connect_with_timeout(&cli.local_host, cli.local_port).await?;
 
     // Extract the underlying stream from the framed connection
-    let parts = control.into_parts();
+    let mut parts = control.into_parts();
 
     debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
 
     // If there's any buffered data from the server, write it to local
     if !parts.read_buf.is_empty() {
         local.write_all(&parts.read_buf).await?;
+        local.flush().await.ok(); // best-effort flush
     }
 
     // Proxy bidirectional data between local service and remote client
-    info!(%id, "proxying data");
-    proxy(local, parts.io).await?;
+    info!(%id, "proxying → local {}:{} ↔ remote", cli.local_host, cli.local_port);
 
-    info!(%id, "proxy connection closed");
+    let (bytes_local_to_remote, bytes_remote_to_local) =
+        copy_bidirectional(&mut local, &mut parts.io).await?;
+
+    info!(
+        %id,
+        bytes_local_to_remote,
+        bytes_remote_to_local,
+        "proxy closed (graceful)"
+    );
+
+    // explicit half-close (usually not needed)
+    let _ = local.shutdown().await;
+    let _ = parts.io.shutdown().await;
+
     Ok(())
 }
 

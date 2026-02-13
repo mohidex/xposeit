@@ -3,18 +3,18 @@ use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, sync::Mutex, time::Du
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use tokio::{
-    io::{self, AsyncWriteExt},
+    io::copy_bidirectional,
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     time::{sleep, timeout},
 };
-use tracing::{info, info_span, warn, Instrument};
+use tracing::{debug, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::protocol::{
     frame::Delimited,
     messages::{ClientMessage, ServerMessage},
 };
-use crate::utils::proxy;
 
 /// Port pool state for efficient port allocation
 struct PortPool {
@@ -65,18 +65,16 @@ pub struct XposeServer {
     /// Concurrent map of IDs to incoming connections.
     conns: Arc<DashMap<Uuid, TcpStream>>,
 
-    /// Port pool for allocation
-    port_pool: Mutex<PortPool>,
+    /// Thread-safe port allocator
+    port_pool: Arc<Mutex<PortPool>>,
 }
 
 impl XposeServer {
     pub fn new(port_range: RangeInclusive<u16>) -> Self {
-        assert!(!port_range.is_empty(), "must provide at least one port");
-        let port_pool = PortPool::new(port_range.clone());
-
+        let port_pool = PortPool::new(port_range);
         Self {
             conns: Arc::new(DashMap::new()),
-            port_pool: Mutex::new(port_pool),
+            port_pool: Arc::new(Mutex::new(port_pool)),
         }
     }
 
@@ -84,8 +82,7 @@ impl XposeServer {
         let this = Arc::new(self);
         let addr = SocketAddr::from(([0, 0, 0, 0], 7835));
         let listener = TcpListener::bind(addr).await?;
-
-        info!(?addr, "server listening");
+        info!(?addr, "control server listening");
 
         loop {
             let (stream, peer) = listener.accept().await?;
@@ -93,9 +90,8 @@ impl XposeServer {
 
             tokio::spawn(
                 async move {
-                    let res = handle_connection(this, stream).await;
-                    if let Err(err) = res {
-                        warn!(%err, "connection exited with error");
+                    if let Err(e) = handle_connection(this, stream).await {
+                        warn!(%e, "connection handler failed");
                     }
                 }
                 .instrument(info_span!("control", ?peer)),
@@ -111,34 +107,26 @@ impl XposeServer {
                 let mut pool = self
                     .port_pool
                     .lock()
-                    .map_err(|e| anyhow!("failed to acquire port pool lock: {}", e))?;
-                pool.next_port(MAX_POOL_REGENERATIONS)
-            };
+                    .map_err(|e| anyhow!("port pool mutex poisoned: {e}"))?;
 
-            let port = match port {
-                Some(p) => p,
-                None => {
-                    return Err(anyhow!(
-                        "failed to find an available port after exhausting all port pools"
-                    ))
-                }
+                pool.next_port(MAX_POOL_REGENERATIONS)
+                    .ok_or_else(|| anyhow!("exhausted all port attempts after regenerations"))?
             };
 
             match TcpListener::bind(("0.0.0.0", port)).await {
-                Ok(l) => {
-                    info!(port, "successfully bound to port");
-                    return Ok(l);
+                Ok(listener) => {
+                    let local = listener.local_addr()?;
+                    info!(port = local.port(), "bound forwarding listener");
+                    return Ok(listener);
                 }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
-                    ) =>
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AddrInUse
+                        || e.kind() == std::io::ErrorKind::PermissionDenied =>
                 {
-                    // Port not available, try next one from pool
+                    debug!(port, "port in use → skipping");
                     continue;
                 }
-                Err(err) => return Err(err.into()),
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -177,34 +165,38 @@ impl Session<Init> {
 impl Session<Opened> {
     async fn run(mut self, server: &XposeServer) -> Result<()> {
         loop {
-            // Heartbeat
+            // Send heartbeat (client can detect dead control link)
             if self.stream.send(ServerMessage::Heartbeat).await.is_err() {
+                debug!("control stream closed during heartbeat");
                 return Ok(());
             }
 
-            // Accept incoming forwarded connections
-            if let Ok(Ok((stream2, addr))) =
-                timeout(Duration::from_millis(500), self.state.listener.accept()).await
-            {
-                let id = Uuid::new_v4();
-                info!(%id, ?addr, "incoming forwarded connection");
+            tokio::select! {
+                // Accept new incoming connection on the forwarded port
+                res = timeout(Duration::from_millis(500), self.state.listener.accept()) => {
+                    if let Ok(Ok((stream2, addr))) = res {
+                        let id = Uuid::new_v4();
+                        info!(%id, ?addr, "new forwarded connection");
 
-                server.conns.insert(id, stream2);
-                spawn_cleanup(server.conns.clone(), id);
+                        server.conns.insert(id, stream2);
+                        spawn_cleanup(server.conns.clone(), id);
 
-                self.stream.send(ServerMessage::Connection(id)).await?;
-            }
+                        // Notify client → "you can now Accept(id)"
+                        let _ = self.stream.send(ServerMessage::Connection(id)).await;
+                    }
+                }
 
-            // Control messages - should not receive anything on control connection
-            if let Ok(Ok(Some(_msg))) = timeout(
-                Duration::from_millis(100),
-                self.stream.recv::<ClientMessage>(),
-            )
-            .await
-            {
-                return Err(anyhow!(
-                    "protocol error: unexpected message on control connection"
-                ));
+                // Should NOT receive client messages on control channel after Open
+                res = timeout(
+                    Duration::from_millis(100),
+                    self.stream.recv::<ClientMessage>(),
+                ) => {
+                    if let Ok(Ok(Some(_))) = res {
+                        return Err(anyhow!("protocol error: unexpected message on control channel"));
+                    }
+                }
+
+                else => continue,
             }
         }
     }
@@ -213,24 +205,27 @@ impl Session<Opened> {
 async fn handle_connection(server: Arc<XposeServer>, stream: TcpStream) -> Result<()> {
     let mut delimited = Delimited::new(stream);
 
-    // Check what type of connection this is
-    match delimited.recv_timeout::<ClientMessage>().await? {
-        Some(ClientMessage::Open) => {
-            // This is a control connection
+    let msg = delimited
+        .recv_timeout::<ClientMessage>()
+        .await?
+        .ok_or_else(|| anyhow!("connection closed before first message"))?;
+
+    match msg {
+        ClientMessage::Open => {
             let session = Session {
                 stream: delimited,
                 state: Init,
             };
-            // Don't call recv_open - we already consumed the Open message
             let session = session.open(&server).await?;
-            session.run(&server).await
+            session.run(&server).await?;
         }
-        Some(ClientMessage::Accept(id)) => {
-            // This is a proxy connection
-            handle_proxy_connection(server, delimited, id).await
+
+        ClientMessage::Accept(id) => {
+            handle_proxy_connection(server, delimited, id).await?;
         }
-        _ => Err(anyhow!("protocol error: expected Open or Accept")),
     }
+
+    Ok(())
 }
 
 async fn handle_proxy_connection(
@@ -238,18 +233,35 @@ async fn handle_proxy_connection(
     delimited: Delimited<TcpStream>,
     id: Uuid,
 ) -> Result<()> {
-    info!(%id, "forwarding connection");
+    info!(%id, "starting proxy");
 
-    let (_, mut stream2) = server
+    let (_, mut upstream) = server
         .conns
         .remove(&id)
-        .ok_or_else(|| anyhow!("missing connection"))?;
+        .ok_or_else(|| anyhow!("no pending connection for id {id}"))?;
 
-    let parts = delimited.into_parts();
-    debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
+    let mut parts = delimited.into_parts();
+    if !parts.write_buf.is_empty() {
+        warn!("write buffer was not empty on proxy start — possible bug");
+    }
 
-    stream2.write_all(&parts.read_buf).await?;
-    proxy(parts.io, stream2).await?;
+    // Flush any already-read payload that came before the Accept
+    if !parts.read_buf.is_empty() {
+        upstream.write_all(&parts.read_buf).await?;
+        upstream.flush().await?;
+    }
+
+    // Bidirectional copy
+    let (bytes_client_to_upstream, bytes_upstream_to_client) =
+        copy_bidirectional(&mut parts.io, &mut upstream).await?;
+
+    info!(
+        %id,
+        bytes_client_to_upstream,
+        bytes_upstream_to_client,
+        "proxy closed gracefully"
+    );
+
     Ok(())
 }
 
@@ -257,7 +269,7 @@ fn spawn_cleanup(conns: Arc<DashMap<Uuid, TcpStream>>, id: Uuid) {
     tokio::spawn(async move {
         sleep(Duration::from_secs(10)).await;
         if conns.remove(&id).is_some() {
-            warn!(%id, "removed stale connection");
+            warn!(%id, "cleaned up stale pending connection");
         }
     });
 }
