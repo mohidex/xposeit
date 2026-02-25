@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, sync::Mutex, time::Duration};
+use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
@@ -6,6 +6,7 @@ use tokio::{
     io::copy_bidirectional,
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
+    sync::Mutex,
     time::{sleep, timeout},
 };
 use tracing::{debug, info, info_span, warn, Instrument};
@@ -16,48 +17,71 @@ use crate::protocol::{
     messages::{ClientMessage, ServerMessage},
 };
 
-/// Port pool state for efficient port allocation
-struct PortPool {
-    /// Shuffled list of ports to try
-    ports: Vec<u16>,
-    /// Current position in the pool
-    current_index: usize,
-    /// Number of times the pool has been exhausted and regenerated
-    pool_regenerations: usize,
-}
+/// Binds exactly `capacity` listeners drawn randomly from `range`.
+/// Skips ports that are already in use. Returns however many it managed
+/// to bind (could be less than `capacity` if the range is smaller or
+/// most ports are taken).
+async fn bind_n_ports(range: RangeInclusive<u16>, capacity: usize) -> Vec<TcpListener> {
+    // Collect the range into a vec and shuffle so we sample randomly.
+    let mut ports: Vec<u16> = range.collect();
+    fastrand::shuffle(&mut ports);
 
-impl PortPool {
-    fn new(port_range: RangeInclusive<u16>) -> Self {
-        let mut ports: Vec<u16> = port_range.collect();
-        fastrand::shuffle(&mut ports);
+    let mut listeners = Vec::with_capacity(capacity);
 
-        Self {
-            ports,
-            current_index: 0,
-            pool_regenerations: 0,
+    for port in ports {
+        if listeners.len() >= capacity {
+            break;
+        }
+
+        match TcpListener::bind(("0.0.0.0", port)).await {
+            Ok(listener) => {
+                debug!(port, "bound forwarding port");
+                listeners.push(listener);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    || e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                // port unavailable — try the next one
+            }
+            Err(e) => {
+                warn!(port, %e, "unexpected bind error — skipping");
+            }
         }
     }
 
-    /// Get the next port from the pool. Returns None if pool is exhausted after max regenerations.
-    fn next_port(&mut self, max_regenerations: usize) -> Option<u16> {
-        if self.current_index >= self.ports.len() {
-            if self.pool_regenerations < max_regenerations {
-                // Reshuffle and reset
-                fastrand::shuffle(&mut self.ports);
-                self.current_index = 0;
-                self.pool_regenerations += 1;
-                warn!(
-                    regeneration = self.pool_regenerations,
-                    "port pool exhausted, regenerating..."
-                );
-            } else {
-                return None;
-            }
-        }
+    info!(
+        bound = listeners.len(),
+        requested = capacity,
+        "listener pool ready"
+    );
 
-        let port = self.ports[self.current_index];
-        self.current_index += 1;
-        Some(port)
+    listeners
+}
+
+/// Pool of pre-bound, ready-to-accept listeners.
+/// Sessions check one out and return it when they finish.
+struct PortAllocator {
+    available: Vec<TcpListener>,
+}
+
+impl PortAllocator {
+    fn new(listeners: Vec<TcpListener>) -> Self {
+        Self {
+            available: listeners,
+        }
+    }
+
+    fn acquire(&mut self) -> Option<TcpListener> {
+        self.available.pop()
+    }
+
+    fn release(&mut self, listener: TcpListener) {
+        self.available.push(listener);
+    }
+
+    fn available(&self) -> usize {
+        self.available.len()
     }
 }
 
@@ -65,16 +89,17 @@ pub struct XposeServer {
     /// Concurrent map of IDs to incoming connections.
     conns: Arc<DashMap<Uuid, TcpStream>>,
 
-    /// Thread-safe port allocator
-    port_pool: Arc<Mutex<PortPool>>,
+    /// Pool of pre-bound listeners for forwarding ports.
+    allocator: Arc<Mutex<PortAllocator>>,
 }
 
 impl XposeServer {
-    pub fn new(port_range: RangeInclusive<u16>) -> Self {
-        let port_pool = PortPool::new(port_range);
+    /// `capacity` — how many ports to pre-bind from `port_range`.
+    pub async fn new(port_range: RangeInclusive<u16>, capacity: usize) -> Self {
+        let listeners = bind_n_ports(port_range, capacity).await;
         Self {
             conns: Arc::new(DashMap::new()),
-            port_pool: Arc::new(Mutex::new(port_pool)),
+            allocator: Arc::new(Mutex::new(PortAllocator::new(listeners))),
         }
     }
 
@@ -99,40 +124,17 @@ impl XposeServer {
         }
     }
 
-    async fn create_listener(&self) -> Result<TcpListener> {
-        const MAX_POOL_REGENERATIONS: usize = 3;
+    async fn acquire_listener(&self) -> Option<TcpListener> {
+        self.allocator.lock().await.acquire()
+    }
 
-        loop {
-            let port = {
-                let mut pool = self
-                    .port_pool
-                    .lock()
-                    .map_err(|e| anyhow!("port pool mutex poisoned: {e}"))?;
-
-                pool.next_port(MAX_POOL_REGENERATIONS)
-                    .ok_or_else(|| anyhow!("exhausted all port attempts after regenerations"))?
-            };
-
-            match TcpListener::bind(("0.0.0.0", port)).await {
-                Ok(listener) => {
-                    let local = listener.local_addr()?;
-                    info!(port = local.port(), "bound forwarding listener");
-                    return Ok(listener);
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::AddrInUse
-                        || e.kind() == std::io::ErrorKind::PermissionDenied =>
-                {
-                    debug!(port, "port in use → skipping");
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+    async fn release_listener(&self, listener: TcpListener) {
+        let mut pool = self.allocator.lock().await;
+        pool.release(listener);
+        debug!(available = pool.available(), "listener returned to pool");
     }
 }
 
-/// Server Session state machine
 struct Session<S> {
     stream: Delimited<TcpStream>,
     state: S,
@@ -148,11 +150,17 @@ struct Opened {
 
 impl Session<Init> {
     async fn open(mut self, server: &XposeServer) -> Result<Session<Opened>> {
-        // Message already received in handle_connection, just create listener
-        let listener = server.create_listener().await?;
-        let port = listener.local_addr()?.port();
+        let listener = match server.acquire_listener().await {
+            Some(l) => l,
+            None => {
+                let msg = "all ports are currently allocated, try again later";
+                let _ = self.stream.send(ServerMessage::Error(msg.into())).await;
+                return Err(anyhow!(msg));
+            }
+        };
 
-        info!(%port, "opened forwarding port");
+        let port = listener.local_addr()?.port();
+        info!(%port, "checked out forwarding port");
         self.stream.send(ServerMessage::Opened(port)).await?;
 
         Ok(Session {
@@ -163,7 +171,13 @@ impl Session<Init> {
 }
 
 impl Session<Opened> {
-    async fn run(mut self, server: &XposeServer) -> Result<()> {
+    /// Runs the session and always gives the listener back to the caller.
+    async fn run(mut self, server: &XposeServer) -> (Result<()>, TcpListener) {
+        let result = self.run_inner(server).await;
+        (result, self.state.listener)
+    }
+
+    async fn run_inner(&mut self, server: &XposeServer) -> Result<()> {
         loop {
             // Send heartbeat (client can detect dead control link)
             if self.stream.send(ServerMessage::Heartbeat).await.is_err() {
@@ -217,7 +231,9 @@ async fn handle_connection(server: Arc<XposeServer>, stream: TcpStream) -> Resul
                 state: Init,
             };
             let session = session.open(&server).await?;
-            session.run(&server).await?;
+            let (result, listener) = session.run(&server).await;
+            server.release_listener(listener).await;
+            result?;
         }
 
         ClientMessage::Accept(id) => {
@@ -251,16 +267,8 @@ async fn handle_proxy_connection(
         upstream.flush().await?;
     }
 
-    // Bidirectional copy
-    let (bytes_client_to_upstream, bytes_upstream_to_client) =
-        copy_bidirectional(&mut parts.io, &mut upstream).await?;
-
-    info!(
-        %id,
-        bytes_client_to_upstream,
-        bytes_upstream_to_client,
-        "proxy closed gracefully"
-    );
+    let (b_up, b_down) = copy_bidirectional(&mut parts.io, &mut upstream).await?;
+    info!(%id, b_up, b_down, "proxy closed gracefully");
 
     Ok(())
 }

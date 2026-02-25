@@ -5,13 +5,18 @@ use xposeit::XposeServer;
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
-    /// Minimum accepted TCP port number.
-    #[clap(long, default_value_t = 1024)]
+    /// Minimum port in the forwarding range.
+    #[clap(long, default_value_t = 9000)]
     min_port: u16,
 
-    /// Maximum accepted TCP port number.
-    #[clap(long, default_value_t = 65535)]
+    /// Maximum port in the forwarding range.
+    #[clap(long, default_value_t = 9999)]
     max_port: u16,
+
+    /// How many ports to pre-bind from the range.
+    /// This is the maximum number of simultaneous clients.
+    #[clap(long, default_value_t = 100)]
+    capacity: usize,
 }
 
 #[tokio::main]
@@ -19,14 +24,21 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let port_range = args.min_port..=args.max_port;
-    if port_range.is_empty() {
+
+    if args.min_port > args.max_port {
         Args::command()
-            .error(ErrorKind::InvalidValue, "port range is empty")
+            .error(ErrorKind::InvalidValue, "min_port must be <= max_port")
             .exit();
     }
 
-    let server = XposeServer::new(port_range);
+    if args.capacity == 0 {
+        Args::command()
+            .error(ErrorKind::InvalidValue, "capacity must be > 0")
+            .exit();
+    }
+
+    let port_range = args.min_port..=args.max_port;
+    let server = XposeServer::new(port_range, args.capacity).await;
     server.listen().await?;
 
     Ok(())
