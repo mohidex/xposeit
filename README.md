@@ -23,7 +23,6 @@ Instantly expose your local applications to the internet. XposeIt is a high-perf
 
 
 ```mermaid
-graph TD
 flowchart TB
  subgraph S["XposeIt Server"]
         CP["Control Port :7835"]
