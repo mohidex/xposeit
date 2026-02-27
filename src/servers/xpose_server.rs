@@ -1,12 +1,10 @@
 use std::{net::SocketAddr, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
-use dashmap::DashMap;
 use tokio::{
     io::copy_bidirectional,
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
-    sync::Mutex,
     time::{sleep, timeout},
 };
 use tracing::{debug, info, info_span, warn, Instrument};
@@ -16,6 +14,7 @@ use crate::protocol::{
     frame::Delimited,
     messages::{ClientMessage, ServerMessage},
 };
+use crate::servers::sessions::{ListenerPool, TunnelStreams};
 
 /// Binds exactly `capacity` listeners drawn randomly from `range`.
 /// Skips ports that are already in use. Returns however many it managed
@@ -59,38 +58,12 @@ async fn bind_n_ports(range: RangeInclusive<u16>, capacity: usize) -> Vec<TcpLis
     listeners
 }
 
-/// Pool of pre-bound, ready-to-accept listeners.
-/// Sessions check one out and return it when they finish.
-struct PortAllocator {
-    available: Vec<TcpListener>,
-}
-
-impl PortAllocator {
-    fn new(listeners: Vec<TcpListener>) -> Self {
-        Self {
-            available: listeners,
-        }
-    }
-
-    fn acquire(&mut self) -> Option<TcpListener> {
-        self.available.pop()
-    }
-
-    fn release(&mut self, listener: TcpListener) {
-        self.available.push(listener);
-    }
-
-    fn available(&self) -> usize {
-        self.available.len()
-    }
-}
-
 pub struct XposeServer {
     /// Concurrent map of IDs to incoming connections.
-    conns: Arc<DashMap<Uuid, TcpStream>>,
+    connections: TunnelStreams,
 
     /// Pool of pre-bound listeners for forwarding ports.
-    allocator: Arc<Mutex<PortAllocator>>,
+    listeners: ListenerPool,
 }
 
 impl XposeServer {
@@ -98,8 +71,8 @@ impl XposeServer {
     pub async fn new(port_range: RangeInclusive<u16>, capacity: usize) -> Self {
         let listeners = bind_n_ports(port_range, capacity).await;
         Self {
-            conns: Arc::new(DashMap::new()),
-            allocator: Arc::new(Mutex::new(PortAllocator::new(listeners))),
+            connections: TunnelStreams::new(),
+            listeners: ListenerPool::new(listeners),
         }
     }
 
@@ -125,13 +98,13 @@ impl XposeServer {
     }
 
     async fn acquire_listener(&self) -> Option<TcpListener> {
-        self.allocator.lock().await.acquire()
+        self.listeners.acquire().await
     }
 
     async fn release_listener(&self, listener: TcpListener) {
-        let mut pool = self.allocator.lock().await;
-        pool.release(listener);
-        debug!(available = pool.available(), "listener returned to pool");
+        self.listeners.release(listener).await;
+        let available = self.listeners.available().await;
+        debug!(available, "listener returned to pool");
     }
 }
 
@@ -192,8 +165,8 @@ impl Session<Opened> {
                         let id = Uuid::new_v4();
                         info!(%id, ?addr, "new forwarded connection");
 
-                        server.conns.insert(id, stream2);
-                        spawn_cleanup(server.conns.clone(), id);
+                        server.connections.insert(id, stream2);
+                        spawn_cleanup(server.connections.clone(), id);
 
                         // Notify client → "you can now Accept(id)"
                         let _ = self.stream.send(ServerMessage::Connection(id)).await;
@@ -252,7 +225,7 @@ async fn handle_proxy_connection(
     info!(%id, "starting proxy");
 
     let (_, mut upstream) = server
-        .conns
+        .connections
         .remove(&id)
         .ok_or_else(|| anyhow!("no pending connection for id {id}"))?;
 
@@ -273,7 +246,7 @@ async fn handle_proxy_connection(
     Ok(())
 }
 
-fn spawn_cleanup(conns: Arc<DashMap<Uuid, TcpStream>>, id: Uuid) {
+fn spawn_cleanup(conns: TunnelStreams, id: Uuid) {
     tokio::spawn(async move {
         sleep(Duration::from_secs(10)).await;
         if conns.remove(&id).is_some() {
