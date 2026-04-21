@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::{error::ErrorKind, CommandFactory, Parser};
+use std::net::SocketAddr;
 use xposeit::XposeServer;
+
+const CONTROL_SERVER_PORT: u16 = 7835;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -38,8 +41,9 @@ async fn main() -> Result<()> {
     }
 
     let port_range = args.min_port..=args.max_port;
-    let server = XposeServer::new(port_range, args.capacity).await;
-    server.listen().await?;
+    let socket_addr = SocketAddr::from(([0, 0, 0, 0], CONTROL_SERVER_PORT));
+    let server = XposeServer::new(port_range, args.capacity).await?;
+    server.listen(socket_addr).await?;
 
     Ok(())
 }

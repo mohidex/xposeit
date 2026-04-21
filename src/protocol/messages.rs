@@ -25,4 +25,7 @@ pub enum ServerMessage {
 
     /// Indicates an error on the server side that terminates the connection.
     Error(String),
+
+    /// Sent while client is queued for a port
+    Waiting,
 }
