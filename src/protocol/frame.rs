@@ -7,9 +7,14 @@ use tokio::time::timeout;
 use tokio_util::codec::{AnyDelimiterCodec, Framed, FramedParts};
 use tracing::trace;
 
-pub struct Delimited<U>(Framed<U, AnyDelimiterCodec>);
+/// A null-delimited JSON transport over any async read/write stream.
+///
+/// Use [`JsonTransport::new`] for plain TCP and the [`JsonTransport::new_tls_*`]
+/// constructors for TLS — the framing, send, and recv behaviour is identical
+/// in all cases.
+pub struct JsonTransport<U>(Framed<U, AnyDelimiterCodec>);
 
-impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
+impl<U: AsyncRead + AsyncWrite + Unpin> JsonTransport<U> {
     /// Construct a new delimited stream.
     pub fn new(stream: U) -> Self {
         let codec = AnyDelimiterCodec::new_with_max_length(vec![0], vec![0], 256);
@@ -53,7 +58,7 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::frame::Delimited;
+    use crate::protocol::frame::JsonTransport;
     use crate::protocol::messages::{ClientMessage, ServerMessage};
     use tokio::net::TcpListener;
     use tokio::net::TcpStream;
@@ -67,7 +72,7 @@ mod tests {
         // Spawn a server task
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await?;
-            let mut delimited = Delimited::new(socket);
+            let mut delimited = JsonTransport::new(socket);
 
             // Receive a message from the client
             let msg: Option<ClientMessage> = delimited.recv().await?;
@@ -80,7 +85,7 @@ mod tests {
 
         // Connect to the server
         let stream = TcpStream::connect(addr).await?;
-        let mut delimited = Delimited::new(stream);
+        let mut delimited = JsonTransport::new(stream);
 
         // Send a message to the server
         delimited.send(ClientMessage::Open).await?;
@@ -104,7 +109,7 @@ mod tests {
         // Spawn a server task
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await?;
-            let delimited = Delimited::new(socket);
+            let delimited = JsonTransport::new(socket);
 
             // Consume the delimited stream and return its parts
             let parts = delimited.into_parts();
@@ -115,7 +120,7 @@ mod tests {
 
         // Connect to the server
         let stream = TcpStream::connect(addr).await?;
-        let delimited = Delimited::new(stream);
+        let delimited = JsonTransport::new(stream);
 
         // Consume the delimited stream and return its parts
         let parts = delimited.into_parts();
@@ -137,7 +142,7 @@ mod tests {
         // Spawn a server task
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await?;
-            let mut delimited = Delimited::new(socket);
+            let mut delimited = JsonTransport::new(socket);
 
             // Receive a message from the client
             let msg: Option<String> = delimited.recv().await?;
@@ -154,7 +159,7 @@ mod tests {
 
         // Connect to the server
         let stream = TcpStream::connect(addr).await?;
-        let mut delimited = Delimited::new(stream);
+        let mut delimited = JsonTransport::new(stream);
 
         // Send a message to the server
         let client_msg = serde_json::to_string(&ClientMessage::Open)?;

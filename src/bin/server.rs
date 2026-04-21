@@ -18,7 +18,7 @@ struct Args {
 
     /// How many ports to pre-bind from the range.
     /// This is the maximum number of simultaneous clients.
-    #[clap(long, default_value_t = 100)]
+    #[clap(long, default_value_t = 2)]
     capacity: usize,
 }
 

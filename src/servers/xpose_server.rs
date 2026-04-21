@@ -12,7 +12,7 @@ use tracing::{debug, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::protocol::{
-    frame::Delimited,
+    frame::JsonTransport,
     messages::{ClientMessage, ServerMessage},
 };
 use crate::servers::sessions::{ListenerPool, TunnelStreams};
@@ -124,7 +124,7 @@ impl XposeServer {
     }
 
     /// Blocks up to `POOL_WAIT_TIMEOUT` for a free listener.
-    async fn acquire_listener(&self, stream: &mut Delimited<TcpStream>) -> Result<TcpListener> {
+    async fn acquire_listener(&self, stream: &mut JsonTransport<TcpStream>) -> Result<TcpListener> {
         // Tell the client immediately so it doesn't time out silently
         let _ = stream.send(ServerMessage::Waiting).await;
 
@@ -169,12 +169,12 @@ struct Opened {
 /// Because `S` is stored as a concrete `state` field, the compiler tracks the
 /// exact type at every call site — no `PhantomData` required.
 struct Session<S> {
-    stream: Delimited<TcpStream>,
+    stream: JsonTransport<TcpStream>,
     state: S,
 }
 
 impl Session<Init> {
-    fn new(stream: Delimited<TcpStream>) -> Self {
+    fn new(stream: JsonTransport<TcpStream>) -> Self {
         Self {
             stream,
             state: Init,
@@ -258,7 +258,7 @@ impl Session<Opened> {
 }
 
 async fn handle_connection(server: Arc<XposeServer>, stream: TcpStream) -> Result<()> {
-    let mut delimited = Delimited::new(stream);
+    let mut delimited = JsonTransport::new(stream);
 
     let msg = delimited
         .recv_timeout::<ClientMessage>()
@@ -284,7 +284,7 @@ async fn handle_connection(server: Arc<XposeServer>, stream: TcpStream) -> Resul
 
 async fn handle_proxy_connection(
     server: &XposeServer,
-    delimited: Delimited<TcpStream>,
+    delimited: JsonTransport<TcpStream>,
     id: Uuid,
 ) -> Result<()> {
     info!(%id, "starting proxy");

@@ -6,7 +6,7 @@ use tracing::{error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::protocol::{
-    frame::Delimited,
+    frame::JsonTransport,
     messages::{ClientMessage, ServerMessage},
 };
 
@@ -27,12 +27,12 @@ struct Opened {
 }
 
 struct Session<S> {
-    conn: Delimited<TcpStream>,
+    conn: JsonTransport<TcpStream>,
     state: S,
 }
 
 impl Session<Init> {
-    fn new(conn: Delimited<TcpStream>) -> Self {
+    fn new(conn: JsonTransport<TcpStream>) -> Self {
         Self { conn, state: Init }
     }
 
@@ -151,7 +151,7 @@ impl XposeCli {
 
     pub async fn run(self) -> Result<()> {
         let stream = connect_with_timeout(&self.server, self.server_port).await?;
-        let session = Session::<Init>::new(Delimited::new(stream));
+        let session = Session::<Init>::new(JsonTransport::new(stream));
         let session = session.open().await?;
         session.listen(Arc::new(self)).await
     }
@@ -163,7 +163,7 @@ async fn handle_proxy(cli: Arc<XposeCli>, id: Uuid) -> Result<()> {
     info!(%id, "establishing proxy connection");
 
     // Each proxy uses its own dedicated connection — never the control channel.
-    let mut control = Delimited::new(connect_with_timeout(&cli.server, cli.server_port).await?);
+    let mut control = JsonTransport::new(connect_with_timeout(&cli.server, cli.server_port).await?);
 
     // Identify this connection to the server.
     control
